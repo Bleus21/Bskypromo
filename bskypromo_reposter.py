@@ -12,11 +12,11 @@ BSKY_USERNAME = os.getenv("BSKY_USERNAME")
 BSKY_PASSWORD = os.getenv("BSKY_PASSWORD")
 
 SEARCH_QUERY = os.getenv("SEARCH_QUERY", "#bskypromo")
-SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "100"))          # hoeveel results we per run binnenhalen
-MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "100"))            # max reposts per run
+SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "200"))          # mag >100, we pagineren
+MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "100"))
 POST_DELAY_SECONDS = float(os.getenv("POST_DELAY_SECONDS", "1.2"))
 
-HOURS_BACK = int(os.getenv("HOURS_BACK", "24"))               # max terugkijken
+HOURS_BACK = int(os.getenv("HOURS_BACK", "24"))
 CLEANUP_DAYS = int(os.getenv("CLEANUP_DAYS", "14"))
 
 FOLLOW_LIST_LINK = os.getenv("FOLLOW_LIST_LINK", "")
@@ -100,13 +100,9 @@ def extract_post_text(post) -> str:
     return getattr(record, "text", "") if record else ""
 
 def contains_hashtag(text: str, tag: str = "#bskypromo") -> bool:
-    # case-insensitive, “losse hashtag” match
     return re.search(rf"(?i)(^|\s){re.escape(tag)}(\s|$|[!,.?:;])", text or "") is not None
 
 def has_media(record) -> bool:
-    """
-    True als record een image/video embed heeft.
-    """
     embed = getattr(record, "embed", None)
     if not embed:
         return False
@@ -130,21 +126,16 @@ def has_media(record) -> bool:
 
     return False
 
-# ================== FOLLOW (FROM LIST) ==================
+# ================== LIST FOLLOW ==================
 
-def follow_list_members(client: Client, list_link: str, state: Dict[str, Any]) -> None:
-    if not list_link:
-        return
-
-    list_uri = normalize_list_uri(client, list_link)
-    if not list_uri:
-        print("⚠️ FOLLOW_LIST_LINK kon niet worden genormalized. Check de link/uri.")
-        return
-
-    target_dids = fetch_list_members(client, list_uri, LIST_MEMBER_LIMIT)
+def follow_list_members(client: Client, list_members: Set[str], state: Dict[str, Any]) -> None:
+    """
+    Volg leden uit je lijst (alleen 'bijvolgen'; geen unfollow).
+    We tracken in state['followed'] om calls te beperken.
+    """
     already_followed: Set[str] = set(state.get("followed", []))
 
-    for did in target_dids:
+    for did in list_members:
         if did == client.me.did:
             continue
         if did in already_followed:
@@ -167,17 +158,43 @@ def follow_list_members(client: Client, list_link: str, state: Dict[str, Any]) -
 
     state["followed"] = sorted(already_followed)
 
-# ================== REPOST / LIKE / CLEANUP ==================
+# ================== SEARCH (PAGED) ==================
 
-def search_posts(client: Client, q: str, limit: int):
-    return client.app.bsky.feed.search_posts({"q": q, "limit": limit})
+def search_posts_paged(client: Client, q: str, max_items: int) -> List:
+    """
+    search_posts: limit <= 100. Pagineren via cursor.
+    """
+    items: List = []
+    cursor = None
+    max_items = int(max_items)
+
+    while len(items) < max_items:
+        batch_limit = min(100, max_items - len(items))
+        if batch_limit <= 0:
+            break
+
+        params = {"q": q, "limit": batch_limit}
+        if cursor:
+            params["cursor"] = cursor
+
+        out = client.app.bsky.feed.search_posts(params)
+        posts = getattr(out, "posts", []) or []
+        items.extend(posts)
+
+        cursor = getattr(out, "cursor", None)
+        if not cursor or not posts:
+            break
+
+    return items[:max_items]
+
+# ================== CLEANUP ==================
 
 def delete_repost_record(client: Client, repost_uri: str) -> bool:
     """
     repost_uri: at://did/app.bsky.feed.repost/rkey
     """
     try:
-        if not repost_uri.startswith("at://"):
+        if not repost_uri or not repost_uri.startswith("at://"):
             return False
         parts = repost_uri.split("/")
         if len(parts) < 5:
@@ -214,7 +231,7 @@ def cleanup_old_reposts(client: Client, state: Dict[str, Any]) -> int:
             removed += 1
             print(f"🧹 Deleted old repost: {repost_uri}")
         else:
-            # keep if we couldn't delete (so we can retry later)
+            # keep if we couldn't delete (retry later)
             keep.append(item)
 
         time.sleep(0.15)
@@ -222,18 +239,20 @@ def cleanup_old_reposts(client: Client, state: Dict[str, Any]) -> int:
     state["reposts"] = keep
     return removed
 
-def do_reposts_and_likes(client: Client, state: Dict[str, Any]) -> int:
+# ================== REPOST + LIKE ==================
+
+def do_reposts_and_likes(client: Client, state: Dict[str, Any], allowed_authors: Set[str]) -> int:
     cutoff = now_dt() - timedelta(hours=HOURS_BACK)
 
     known_post_uris = {x.get("post_uri") for x in state.get("reposts", []) if x.get("post_uri")}
-    out = search_posts(client, SEARCH_QUERY, SEARCH_LIMIT)
-    posts = getattr(out, "posts", []) or []
 
-    # search is vaak newest-first; wij doen oldest-first voor nette verwerking
+    posts = search_posts_paged(client, SEARCH_QUERY, SEARCH_LIMIT)
+
     def created_dt(p) -> datetime:
         rec = getattr(p, "record", None)
-        dt = parse_dt(getattr(rec, "createdAt", "")) or now_dt()
-        return dt
+        return parse_dt(getattr(rec, "createdAt", "")) or now_dt()
+
+    # oldest-first
     posts.sort(key=created_dt)
 
     made = 0
@@ -254,11 +273,15 @@ def do_reposts_and_likes(client: Client, state: Dict[str, Any]) -> int:
             continue
 
         # 24h cutoff
-        p_created = created_dt(p)
-        if p_created < cutoff:
+        if created_dt(p) < cutoff:
             continue
 
-        # must contain hashtag AND must be media (replies toegestaan)
+        # must be in list
+        author_did = getattr(getattr(p, "author", None), "did", None)
+        if not author_did or author_did not in allowed_authors:
+            continue
+
+        # hashtag + media (replies toegestaan)
         txt = extract_post_text(p)
         if not contains_hashtag(txt, "#bskypromo"):
             continue
@@ -268,15 +291,14 @@ def do_reposts_and_likes(client: Client, state: Dict[str, Any]) -> int:
         try:
             ts = now_iso()
 
-            # 🔁 repost
+            # repost
             created_out = client.app.bsky.feed.repost.create(
                 repo=client.me.did,
                 record={"subject": {"uri": post_uri, "cid": post_cid}, "createdAt": ts},
             )
-
             repost_uri = getattr(created_out, "uri", None)
 
-            # ❤️ like
+            # like
             client.app.bsky.feed.like.create(
                 repo=client.me.did,
                 record={"subject": {"uri": post_uri, "cid": post_cid}, "createdAt": ts},
@@ -313,14 +335,23 @@ def main():
 
     state = load_state(STATE_FILE)
 
-    # 1) follow list (jij beheert list)
-    follow_list_members(client, FOLLOW_LIST_LINK, state)
+    # Load list members once and reuse as allowlist
+    list_uri = normalize_list_uri(client, FOLLOW_LIST_LINK)
+    if not list_uri:
+        print("❌ FOLLOW_LIST_LINK invalid / could not normalize.")
+        return
 
-    # 2) cleanup reposts older than 14 days
+    allowed_authors = set(fetch_list_members(client, list_uri, LIST_MEMBER_LIMIT))
+    print(f"📋 Loaded {len(allowed_authors)} authors from list")
+
+    # Follow list members (bijvolgen)
+    follow_list_members(client, allowed_authors, state)
+
+    # Cleanup old reposts
     removed = cleanup_old_reposts(client, state)
 
-    # 3) repost + like media posts with #bskypromo from last 24 hours
-    made = do_reposts_and_likes(client, state)
+    # Repost+like only allowed authors
+    made = do_reposts_and_likes(client, state, allowed_authors)
 
     save_state(STATE_FILE, state)
     print(f"🔥 Done — reposted+liked: {made}, cleaned: {removed}, tracked: {len(state.get('reposts', []))}")
