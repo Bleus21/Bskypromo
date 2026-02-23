@@ -1,0 +1,52 @@
+name: Bskypromo Hashtag Reposter
+
+on:
+  schedule:
+    - cron: "37 * * * *" # ieder uur op minuut 37 (UTC in GitHub Actions)
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          pip install atproto
+
+      - name: Run bot
+        env:
+          BSKY_USERNAME: ${{ secrets.BSKY_USERNAME }}
+          BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
+
+          SEARCH_QUERY: "#bskypromo"
+          SEARCH_LIMIT: "200"
+          MAX_PER_RUN: "100"
+          POST_DELAY_SECONDS: "1.2"
+
+          HOURS_BACK: "24"
+          CLEANUP_DAYS: "14"
+
+          FOLLOW_LIST_LINK: "https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkgvhx3w22o"
+          LIST_MEMBER_LIMIT: "500"
+
+          STATE_FILE: "state.json"
+        run: python bskypromo_reposter.py
+
+      - name: Commit state
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "actions@github.com"
+          git add state.json
+          git commit -m "Update state [auto]" || echo "No changes"
+          git push
