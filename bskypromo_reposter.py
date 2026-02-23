@@ -12,7 +12,7 @@ BSKY_USERNAME = os.getenv("BSKY_USERNAME")
 BSKY_PASSWORD = os.getenv("BSKY_PASSWORD")
 
 SEARCH_QUERY = os.getenv("SEARCH_QUERY", "#bskypromo")
-SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "200"))          # hoeveel results we per run binnenhalen
+SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "100"))          # hoeveel results we per run binnenhalen
 MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "100"))            # max reposts per run
 POST_DELAY_SECONDS = float(os.getenv("POST_DELAY_SECONDS", "1.2"))
 
