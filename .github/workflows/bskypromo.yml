@@ -1,8 +1,8 @@
-name: Bskypromo Hashtag Reposter
+name: Bskypromo Feed Reposter
 
 on:
   schedule:
-    - cron: "37 * * * *" # ieder uur op minuut 37 (UTC in GitHub Actions)
+    - cron: "37 * * * *" # ieder uur op minuut 37 (GitHub cron = UTC)
   workflow_dispatch:
 
 permissions:
@@ -11,6 +11,7 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
@@ -29,16 +30,19 @@ jobs:
           BSKY_USERNAME: ${{ secrets.BSKY_USERNAME }}
           BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
 
-          SEARCH_QUERY: "#bskypromo"
-          SEARCH_LIMIT: "100"
-          MAX_PER_RUN: "100"
-          POST_DELAY_SECONDS: "1.2"
+          FEED_LINK: "https://bsky.app/profile/did:plc:jaka644beit3x4vmmg6yysw7/feed/aaaipcjvdtvu4"
+          EXCLUDE_LIST_LINK: "https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkghzcmt72w"
 
+          MAX_PER_RUN: "100"
           HOURS_BACK: "24"
           CLEANUP_DAYS: "14"
+          POST_DELAY_SECONDS: "1.2"
 
-          FOLLOW_LIST_LINK: "https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkgvhx3w22o"
+          FEED_MAX_ITEMS: "1000"
           LIST_MEMBER_LIMIT: "500"
+
+          DUP_CHECK_AUTHOR_FEED_LIMIT: "100"
+          DUP_CHECK_CACHE: "4000"
 
           STATE_FILE: "state.json"
         run: python bskypromo_reposter.py
