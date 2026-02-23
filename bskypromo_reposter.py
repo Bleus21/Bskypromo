@@ -4,15 +4,21 @@ import re
 import json
 import time
 from datetime import datetime, timedelta, timezone
-from typing import Optional, Dict, Any, List, Set
+from typing import Optional, Dict, Any, List, Set, Tuple
 
 # ================== ENV CONFIG ==================
 
 BSKY_USERNAME = os.getenv("BSKY_USERNAME")
 BSKY_PASSWORD = os.getenv("BSKY_PASSWORD")
 
-SEARCH_QUERY = os.getenv("SEARCH_QUERY", "#bskypromo")
-SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "200"))          # can be >100; we page safely
+# ✅ Source feed (your custom feed)
+FEED_LINK = os.getenv(
+    "FEED_LINK",
+    "https://bsky.app/profile/did:plc:jaka644beit3x4vmmg6yysw7/feed/aaaipcjvdtvu4",
+)
+
+HASHTAG = os.getenv("HASHTAG", "#bskypromo")
+
 MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "100"))
 POST_DELAY_SECONDS = float(os.getenv("POST_DELAY_SECONDS", "1.2"))
 
@@ -22,9 +28,14 @@ CLEANUP_DAYS = int(os.getenv("CLEANUP_DAYS", "14"))
 FOLLOW_LIST_LINK = os.getenv("FOLLOW_LIST_LINK", "")
 LIST_MEMBER_LIMIT = int(os.getenv("LIST_MEMBER_LIMIT", "500"))
 
+# feed paging
+FEED_MAX_ITEMS = int(os.getenv("FEED_MAX_ITEMS", "1000"))  # max items we pull per run
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
+# ================== REGEX ==================
+
 LIST_URL_RE = re.compile(r"https://bsky\.app/profile/([^/]+)/lists/([^/?#]+)", re.I)
+FEED_URL_RE = re.compile(r"https://bsky\.app/profile/([^/]+)/feed/([^/?#]+)", re.I)
 
 # ================== UTILS ==================
 
@@ -76,6 +87,19 @@ def normalize_list_uri(client: Client, link: str) -> Optional[str]:
         return None
     return f"at://{did}/app.bsky.graph.list/{m.group(2)}"
 
+def normalize_feed_uri(client: Client, link: str) -> Optional[str]:
+    if not link:
+        return None
+    if link.startswith("at://"):
+        return link
+    m = FEED_URL_RE.match(link)
+    if not m:
+        return None
+    did = resolve_handle_to_did(client, m.group(1))
+    if not did:
+        return None
+    return f"at://{did}/app.bsky.feed.generator/{m.group(2)}"
+
 def fetch_list_members(client: Client, list_uri: str, limit: int) -> List[str]:
     members, cursor = [], None
     while True:
@@ -99,7 +123,8 @@ def extract_post_text(post) -> str:
     record = getattr(post, "record", None)
     return getattr(record, "text", "") if record else ""
 
-def contains_hashtag(text: str, tag: str = "#bskypromo") -> bool:
+def contains_hashtag(text: str, tag: str) -> bool:
+    # case-insensitive, “losse hashtag” match
     return re.search(rf"(?i)(^|\s){re.escape(tag)}(\s|$|[!,.?:;])", text or "") is not None
 
 def has_media(record) -> bool:
@@ -126,7 +151,27 @@ def has_media(record) -> bool:
 
     return False
 
-# ================== LIST FOLLOW ==================
+def robust_post_time_from_post(post) -> datetime:
+    """
+    Stable timestamp for sorting:
+    1) record.createdAt
+    2) post.indexedAt (if present)
+    3) epoch (never now -> ordering won't flip)
+    """
+    record = getattr(post, "record", None)
+    created = getattr(record, "createdAt", None) if record else None
+    dt = parse_dt(created) if created else None
+    if dt:
+        return dt
+
+    indexed = getattr(post, "indexedAt", None)
+    dt2 = parse_dt(indexed) if indexed else None
+    if dt2:
+        return dt2
+
+    return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+# ================== FOLLOW LIST MEMBERS ==================
 
 def follow_list_members(client: Client, list_members: Set[str], state: Dict[str, Any]) -> None:
     """
@@ -157,11 +202,11 @@ def follow_list_members(client: Client, list_members: Set[str], state: Dict[str,
 
     state["followed"] = sorted(already_followed)
 
-# ================== SEARCH (PAGED) ==================
+# ================== FEED FETCH (PAGED) ==================
 
-def search_posts_paged(client: Client, q: str, max_items: int) -> List:
+def fetch_feed_items(client: Client, feed_uri: str, max_items: int) -> List:
     """
-    search_posts limit <= 100; page via cursor until max_items.
+    app.bsky.feed.get_feed limit <= 100; page via cursor until max_items.
     """
     items: List = []
     cursor = None
@@ -172,16 +217,16 @@ def search_posts_paged(client: Client, q: str, max_items: int) -> List:
         if batch_limit <= 0:
             break
 
-        params = {"q": q, "limit": batch_limit}
+        params = {"feed": feed_uri, "limit": batch_limit}
         if cursor:
             params["cursor"] = cursor
 
-        out = client.app.bsky.feed.search_posts(params)
-        posts = getattr(out, "posts", []) or []
-        items.extend(posts)
+        out = client.app.bsky.feed.get_feed(params)
+        batch = getattr(out, "feed", []) or []
+        items.extend(batch)
 
         cursor = getattr(out, "cursor", None)
-        if not cursor or not posts:
+        if not cursor or not batch:
             break
 
     return items[:max_items]
@@ -237,82 +282,79 @@ def cleanup_old_reposts(client: Client, state: Dict[str, Any]) -> int:
     state["reposts"] = keep
     return removed
 
-# ================== REPOST + LIKE ==================
+# ================== REPOST + LIKE (FROM FEED) ==================
 
-def robust_post_time(p) -> datetime:
+def build_candidates_from_feed(feed_items: List, allowed_authors: Set[str], cutoff: datetime) -> List[Tuple[datetime, str, str, str]]:
     """
-    Stable timestamp for sorting:
-    1) record.createdAt
-    2) p.indexedAt
-    3) epoch (never 'now' so ordering never flips)
+    Returns list of tuples:
+    (post_time, post_uri, post_cid, author_did)
     """
-    record = getattr(p, "record", None)
+    candidates: List[Tuple[datetime, str, str, str]] = []
 
-    created = getattr(record, "createdAt", None) if record else None
-    dt = parse_dt(created) if created else None
-    if dt:
-        return dt
-
-    indexed = getattr(p, "indexedAt", None)
-    dt2 = parse_dt(indexed) if indexed else None
-    if dt2:
-        return dt2
-
-    return datetime(1970, 1, 1, tzinfo=timezone.utc)
-
-def do_reposts_and_likes(client: Client, state: Dict[str, Any], allowed_authors: Set[str]) -> int:
-    cutoff = now_dt() - timedelta(hours=HOURS_BACK)
-    known_post_uris = {x.get("post_uri") for x in state.get("reposts", []) if x.get("post_uri")}
-
-    posts = search_posts_paged(client, SEARCH_QUERY, SEARCH_LIMIT)
-
-    # OLDEST FIRST so that the NEWEST original ends up TOP on your profile (last repost wins)
-    posts.sort(key=robust_post_time)
-
-    made = 0
-    for p in posts:
-        if made >= MAX_PER_RUN:
-            break
-
-        post_uri = getattr(p, "uri", None)
-        post_cid = getattr(p, "cid", None)
-        if not post_uri or not post_cid:
+    for it in feed_items:
+        post = getattr(it, "post", None)
+        if not post:
             continue
 
-        if post_uri in known_post_uris:
+        post_uri = getattr(post, "uri", None)
+        post_cid = getattr(post, "cid", None)
+        author_did = getattr(getattr(post, "author", None), "did", None)
+        record = getattr(post, "record", None)
+
+        if not post_uri or not post_cid or not author_did or not record:
+            continue
+
+        # allowlist
+        if author_did not in allowed_authors:
             continue
 
         # time window
-        if robust_post_time(p) < cutoff:
-            continue
-
-        # must be in your list (allowlist)
-        author_did = getattr(getattr(p, "author", None), "did", None)
-        if not author_did or author_did not in allowed_authors:
-            continue
-
-        record = getattr(p, "record", None)
-        if not record:
+        p_time = robust_post_time_from_post(post)
+        if p_time < cutoff:
             continue
 
         # hashtag + media (replies allowed)
-        txt = extract_post_text(p)
-        if not contains_hashtag(txt, "#bskypromo"):
+        txt = extract_post_text(post)
+        if not contains_hashtag(txt, HASHTAG):
             continue
         if not has_media(record):
+            continue
+
+        candidates.append((p_time, post_uri, post_cid, author_did))
+
+    return candidates
+
+def do_reposts_and_likes_from_feed(
+    client: Client,
+    state: Dict[str, Any],
+    allowed_authors: Set[str],
+    feed_uri: str,
+) -> int:
+    cutoff = now_dt() - timedelta(hours=HOURS_BACK)
+    known_post_uris = {x.get("post_uri") for x in state.get("reposts", []) if x.get("post_uri")}
+
+    feed_items = fetch_feed_items(client, feed_uri, FEED_MAX_ITEMS)
+    candidates = build_candidates_from_feed(feed_items, allowed_authors, cutoff)
+
+    # ✅ Oldest-first so newest ends up on top (last repost is newest original)
+    candidates.sort(key=lambda x: x[0])
+
+    made = 0
+    for p_time, post_uri, post_cid, author_did in candidates:
+        if made >= MAX_PER_RUN:
+            break
+        if post_uri in known_post_uris:
             continue
 
         try:
             ts = now_iso()
 
-            # repost
             created_out = client.app.bsky.feed.repost.create(
                 repo=client.me.did,
                 record={"subject": {"uri": post_uri, "cid": post_cid}, "createdAt": ts},
             )
             repost_uri = getattr(created_out, "uri", None)
 
-            # like
             client.app.bsky.feed.like.create(
                 repo=client.me.did,
                 record={"subject": {"uri": post_uri, "cid": post_cid}, "createdAt": ts},
@@ -328,7 +370,7 @@ def do_reposts_and_likes(client: Client, state: Dict[str, Any], allowed_authors:
             known_post_uris.add(post_uri)
             made += 1
 
-            print(f"✅ Reposted + liked: {post_uri} | post_time={robust_post_time(p).isoformat()} | author={author_did}")
+            print(f"✅ Reposted+liked: {post_uri} | post_time={p_time.isoformat()} | author={author_did}")
             time.sleep(POST_DELAY_SECONDS)
 
         except Exception as e:
@@ -350,7 +392,7 @@ def main():
 
     state = load_state(STATE_FILE)
 
-    # Load list members once and use as allowlist
+    # list -> allowlist
     list_uri = normalize_list_uri(client, FOLLOW_LIST_LINK)
     if not list_uri:
         print("❌ FOLLOW_LIST_LINK invalid / could not normalize.")
@@ -359,14 +401,20 @@ def main():
     allowed_authors = set(fetch_list_members(client, list_uri, LIST_MEMBER_LIMIT))
     print(f"📋 Loaded {len(allowed_authors)} authors from list")
 
-    # Follow list members (only follow, no unfollow)
+    # follow (bijvolgen)
     follow_list_members(client, allowed_authors, state)
 
-    # Cleanup old reposts
+    # cleanup
     removed = cleanup_old_reposts(client, state)
 
-    # Repost + like (oldest first so newest ends up on top)
-    made = do_reposts_and_likes(client, state, allowed_authors)
+    # feed -> repost + like
+    feed_uri = normalize_feed_uri(client, FEED_LINK)
+    if not feed_uri:
+        print("❌ FEED_LINK invalid / could not normalize.")
+        return
+
+    print(f"🧲 Using feed: {feed_uri}")
+    made = do_reposts_and_likes_from_feed(client, state, allowed_authors, feed_uri)
 
     save_state(STATE_FILE, state)
     print(f"🔥 Done — reposted+liked: {made}, cleaned: {removed}, tracked: {len(state.get('reposts', []))}")
