@@ -12,7 +12,7 @@ BSKY_USERNAME = os.getenv("BSKY_USERNAME")
 BSKY_PASSWORD = os.getenv("BSKY_PASSWORD")
 
 SEARCH_QUERY = os.getenv("SEARCH_QUERY", "#bskypromo")
-SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "200"))          # mag >100, we pagineren
+SEARCH_LIMIT = int(os.getenv("SEARCH_LIMIT", "200"))          # can be >100; we page safely
 MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "100"))
 POST_DELAY_SECONDS = float(os.getenv("POST_DELAY_SECONDS", "1.2"))
 
@@ -130,8 +130,7 @@ def has_media(record) -> bool:
 
 def follow_list_members(client: Client, list_members: Set[str], state: Dict[str, Any]) -> None:
     """
-    Volg leden uit je lijst (alleen 'bijvolgen'; geen unfollow).
-    We tracken in state['followed'] om calls te beperken.
+    Follow members from your manually-managed list (only follow; no unfollow).
     """
     already_followed: Set[str] = set(state.get("followed", []))
 
@@ -162,7 +161,7 @@ def follow_list_members(client: Client, list_members: Set[str], state: Dict[str,
 
 def search_posts_paged(client: Client, q: str, max_items: int) -> List:
     """
-    search_posts: limit <= 100. Pagineren via cursor.
+    search_posts limit <= 100; page via cursor until max_items.
     """
     items: List = []
     cursor = None
@@ -231,7 +230,6 @@ def cleanup_old_reposts(client: Client, state: Dict[str, Any]) -> int:
             removed += 1
             print(f"🧹 Deleted old repost: {repost_uri}")
         else:
-            # keep if we couldn't delete (retry later)
             keep.append(item)
 
         time.sleep(0.15)
@@ -241,19 +239,35 @@ def cleanup_old_reposts(client: Client, state: Dict[str, Any]) -> int:
 
 # ================== REPOST + LIKE ==================
 
+def robust_post_time(p) -> datetime:
+    """
+    Stable timestamp for sorting:
+    1) record.createdAt
+    2) p.indexedAt
+    3) epoch (never 'now' so ordering never flips)
+    """
+    record = getattr(p, "record", None)
+
+    created = getattr(record, "createdAt", None) if record else None
+    dt = parse_dt(created) if created else None
+    if dt:
+        return dt
+
+    indexed = getattr(p, "indexedAt", None)
+    dt2 = parse_dt(indexed) if indexed else None
+    if dt2:
+        return dt2
+
+    return datetime(1970, 1, 1, tzinfo=timezone.utc)
+
 def do_reposts_and_likes(client: Client, state: Dict[str, Any], allowed_authors: Set[str]) -> int:
     cutoff = now_dt() - timedelta(hours=HOURS_BACK)
-
     known_post_uris = {x.get("post_uri") for x in state.get("reposts", []) if x.get("post_uri")}
 
     posts = search_posts_paged(client, SEARCH_QUERY, SEARCH_LIMIT)
 
-    def created_dt(p) -> datetime:
-        rec = getattr(p, "record", None)
-        return parse_dt(getattr(rec, "createdAt", "")) or now_dt()
-
-    # oldest-first
-    posts.sort(key=created_dt)
+    # OLDEST FIRST so that the NEWEST original ends up TOP on your profile (last repost wins)
+    posts.sort(key=robust_post_time)
 
     made = 0
     for p in posts:
@@ -268,20 +282,20 @@ def do_reposts_and_likes(client: Client, state: Dict[str, Any], allowed_authors:
         if post_uri in known_post_uris:
             continue
 
-        record = getattr(p, "record", None)
-        if not record:
+        # time window
+        if robust_post_time(p) < cutoff:
             continue
 
-        # 24h cutoff
-        if created_dt(p) < cutoff:
-            continue
-
-        # must be in list
+        # must be in your list (allowlist)
         author_did = getattr(getattr(p, "author", None), "did", None)
         if not author_did or author_did not in allowed_authors:
             continue
 
-        # hashtag + media (replies toegestaan)
+        record = getattr(p, "record", None)
+        if not record:
+            continue
+
+        # hashtag + media (replies allowed)
         txt = extract_post_text(p)
         if not contains_hashtag(txt, "#bskypromo"):
             continue
@@ -313,7 +327,8 @@ def do_reposts_and_likes(client: Client, state: Dict[str, Any], allowed_authors:
 
             known_post_uris.add(post_uri)
             made += 1
-            print(f"✅ Reposted + liked: {post_uri}")
+
+            print(f"✅ Reposted + liked: {post_uri} | post_time={robust_post_time(p).isoformat()} | author={author_did}")
             time.sleep(POST_DELAY_SECONDS)
 
         except Exception as e:
@@ -335,7 +350,7 @@ def main():
 
     state = load_state(STATE_FILE)
 
-    # Load list members once and reuse as allowlist
+    # Load list members once and use as allowlist
     list_uri = normalize_list_uri(client, FOLLOW_LIST_LINK)
     if not list_uri:
         print("❌ FOLLOW_LIST_LINK invalid / could not normalize.")
@@ -344,13 +359,13 @@ def main():
     allowed_authors = set(fetch_list_members(client, list_uri, LIST_MEMBER_LIMIT))
     print(f"📋 Loaded {len(allowed_authors)} authors from list")
 
-    # Follow list members (bijvolgen)
+    # Follow list members (only follow, no unfollow)
     follow_list_members(client, allowed_authors, state)
 
     # Cleanup old reposts
     removed = cleanup_old_reposts(client, state)
 
-    # Repost+like only allowed authors
+    # Repost + like (oldest first so newest ends up on top)
     made = do_reposts_and_likes(client, state, allowed_authors)
 
     save_state(STATE_FILE, state)
