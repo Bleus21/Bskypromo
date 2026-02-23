@@ -20,9 +20,9 @@ FEED_LINK = os.getenv(
 HASHTAG = os.getenv("HASHTAG", "#bskypromo")
 
 MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "100"))
-POST_DELAY_SECONDS = float(os.getenv("POST_DELAY_SECONDS", "1.2"))
+POST_DELAY_SECONDS = float(os.getenv("POST_DELAY_SECONDS", "3"))
 
-HOURS_BACK = int(os.getenv("HOURS_BACK", "24"))
+HOURS_BACK = int(os.getenv("HOURS_BACK", "3"))
 CLEANUP_DAYS = int(os.getenv("CLEANUP_DAYS", "14"))
 
 FOLLOW_LIST_LINK = os.getenv("FOLLOW_LIST_LINK", "")
