@@ -11,13 +11,11 @@ from typing import Optional, Dict, Any, List, Set, Tuple
 BSKY_USERNAME = os.getenv("BSKY_USERNAME")
 BSKY_PASSWORD = os.getenv("BSKY_PASSWORD")
 
-# Source feed (custom feed generator link)
 FEED_LINK = os.getenv(
     "FEED_LINK",
     "https://bsky.app/profile/did:plc:jaka644beit3x4vmmg6yysw7/feed/aaaipcjvdtvu4",
 )
 
-# Exclude list (bsky.app list link OR at://... list uri)
 EXCLUDE_LIST_LINK = os.getenv(
     "EXCLUDE_LIST_LINK",
     "https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkghzcmt72w",
@@ -29,15 +27,18 @@ POST_DELAY_SECONDS = float(os.getenv("POST_DELAY_SECONDS", "1.2"))
 HOURS_BACK = int(os.getenv("HOURS_BACK", "24"))
 CLEANUP_DAYS = int(os.getenv("CLEANUP_DAYS", "14"))
 
-# Paging
 FEED_MAX_ITEMS = int(os.getenv("FEED_MAX_ITEMS", "1000"))
 LIST_MEMBER_LIMIT = int(os.getenv("LIST_MEMBER_LIMIT", "500"))
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-# Extra anti-dup safety (API check + cache)
-DUP_CHECK_AUTHOR_FEED_LIMIT = int(os.getenv("DUP_CHECK_AUTHOR_FEED_LIMIT", "100"))  # max 100 per API call
-DUP_CHECK_CACHE = int(os.getenv("DUP_CHECK_CACHE", "4000"))  # keep last N URIs cached in state
+# Anti-dup safety
+DUP_CHECK_AUTHOR_FEED_LIMIT = int(os.getenv("DUP_CHECK_AUTHOR_FEED_LIMIT", "100"))  # <= 100
+DUP_CHECK_CACHE = int(os.getenv("DUP_CHECK_CACHE", "4000"))
+
+# Debug + switches
+DEBUG = os.getenv("DEBUG", "0") == "1"
+MEDIA_ONLY = os.getenv("MEDIA_ONLY", "1") == "1"  # set to 0 to test quickly
 
 LIST_URL_RE = re.compile(r"https://bsky\.app/profile/([^/]+)/lists/([^/?#]+)", re.I)
 FEED_URL_RE = re.compile(r"https://bsky\.app/profile/([^/]+)/feed/([^/?#]+)", re.I)
@@ -129,19 +130,13 @@ def fetch_list_members(client: Client, list_uri: str, limit: int) -> List[str]:
     return members[:limit]
 
 def has_media(record) -> bool:
-    """
-    True if record has image/video media embeds.
-    Replies with media are allowed (we do not exclude replies).
-    """
     embed = getattr(record, "embed", None)
     if not embed:
         return False
-
     if getattr(embed, "images", None):
         return True
     if getattr(embed, "video", None):
         return True
-
     rwm = getattr(embed, "recordWithMedia", None)
     if rwm:
         media = getattr(rwm, "media", None)
@@ -150,35 +145,23 @@ def has_media(record) -> bool:
                 return True
             if getattr(media, "video", None):
                 return True
-
     return False
 
 def robust_post_time(post) -> datetime:
-    """
-    Stable timestamp for sorting:
-    1) post.record.createdAt
-    2) post.indexedAt
-    3) epoch (never now -> ordering never flips)
-    """
     record = getattr(post, "record", None)
     created = getattr(record, "createdAt", None) if record else None
     dt = parse_dt(created) if created else None
     if dt:
         return dt
-
     indexed = getattr(post, "indexedAt", None)
     dt2 = parse_dt(indexed) if indexed else None
     if dt2:
         return dt2
-
     return datetime(1970, 1, 1, tzinfo=timezone.utc)
 
 # ================== FEED FETCH (PAGED) ==================
 
 def fetch_feed_items(client: Client, feed_uri: str, max_items: int) -> List:
-    """
-    app.bsky.feed.get_feed limit <= 100; page via cursor until max_items.
-    """
     items: List = []
     cursor = None
     max_items = int(max_items)
@@ -187,27 +170,20 @@ def fetch_feed_items(client: Client, feed_uri: str, max_items: int) -> List:
         batch_limit = min(100, max_items - len(items))
         if batch_limit <= 0:
             break
-
         params = {"feed": feed_uri, "limit": batch_limit}
         if cursor:
             params["cursor"] = cursor
-
         out = client.app.bsky.feed.get_feed(params)
         batch = getattr(out, "feed", []) or []
         items.extend(batch)
-
         cursor = getattr(out, "cursor", None)
         if not cursor or not batch:
             break
-
     return items[:max_items]
 
 # ================== CLEANUP ==================
 
 def delete_repost_record(client: Client, repost_uri: str) -> bool:
-    """
-    repost_uri: at://did/app.bsky.feed.repost/rkey
-    """
     try:
         if not repost_uri or not repost_uri.startswith("at://"):
             return False
@@ -219,48 +195,37 @@ def delete_repost_record(client: Client, repost_uri: str) -> bool:
         rkey = parts[4]
         if did != client.me.did:
             return False
-
         client.com.atproto.repo.delete_record({
             "repo": client.me.did,
             "collection": collection,
             "rkey": rkey
         })
         return True
-    except Exception as e:
-        print(f"⚠️ Delete repost error: {e}")
+    except Exception:
         return False
 
 def cleanup_old_reposts(client: Client, state: Dict[str, Any]) -> int:
     cutoff = now_dt() - timedelta(days=CLEANUP_DAYS)
     keep = []
     removed = 0
-
     for item in state.get("reposts", []):
         created_dt = parse_dt(item.get("createdAt", "")) or now_dt()
         if created_dt >= cutoff:
             keep.append(item)
             continue
-
         repost_uri = item.get("repost_uri")
         if repost_uri and delete_repost_record(client, repost_uri):
             removed += 1
         else:
             keep.append(item)
-
     state["reposts"] = keep
     return removed
 
 # ================== ANTI-DUP SAFETY ==================
 
 def build_viewer_sets_from_own_feed(client: Client, limit: int) -> Tuple[Set[str], Set[str]]:
-    """
-    Scan your own author feed and collect URIs you already reposted/liked.
-    Uses viewer fields: viewer.repost / viewer.like if available.
-    Note: API limit is <= 100.
-    """
     reposted_uris: Set[str] = set()
     liked_uris: Set[str] = set()
-
     try:
         out = client.app.bsky.feed.get_author_feed({"actor": client.me.did, "limit": min(int(limit), 100)})
         feed = getattr(out, "feed", []) or []
@@ -275,16 +240,13 @@ def build_viewer_sets_from_own_feed(client: Client, limit: int) -> Tuple[Set[str
         viewer = getattr(post, "viewer", None)
         if not uri or not viewer:
             continue
-
         if getattr(viewer, "repost", None):
             reposted_uris.add(uri)
         if getattr(viewer, "like", None):
             liked_uris.add(uri)
-
     return reposted_uris, liked_uris
 
 def update_seen_cache(state: Dict[str, Any], reposted: Set[str], liked: Set[str]) -> None:
-    # keep cache bounded
     sr = list(dict.fromkeys(list(reposted) + state.get("seen_reposted", [])))[:DUP_CHECK_CACHE]
     sl = list(dict.fromkeys(list(liked) + state.get("seen_liked", [])))[:DUP_CHECK_CACHE]
     state["seen_reposted"] = sr
@@ -295,10 +257,7 @@ def update_seen_cache(state: Dict[str, Any], reposted: Set[str], liked: Set[str]
 def do_reposts(client: Client, state: Dict[str, Any], feed_uri: str, exclude_authors: Set[str]) -> int:
     cutoff = now_dt() - timedelta(hours=HOURS_BACK)
 
-    # state-tracked reposts
     known_state = {x.get("post_uri") for x in state.get("reposts", []) if x.get("post_uri")}
-
-    # extra safety: your own feed viewer flags + cached URIs
     api_reposted, api_liked = build_viewer_sets_from_own_feed(client, DUP_CHECK_AUTHOR_FEED_LIMIT)
     cached_reposted = set(state.get("seen_reposted", []))
     cached_liked = set(state.get("seen_liked", []))
@@ -307,8 +266,11 @@ def do_reposts(client: Client, state: Dict[str, Any], feed_uri: str, exclude_aut
     already_liked = api_liked | cached_liked
 
     feed_items = fetch_feed_items(client, feed_uri, FEED_MAX_ITEMS)
+    print(f"🧪 feed_items fetched: {len(feed_items)} | cutoff={cutoff.isoformat()} | media_only={MEDIA_ONLY}")
 
+    counts = {"missing": 0, "excluded": 0, "already": 0, "too_old": 0, "no_media": 0, "ok": 0}
     candidates: List[Tuple[datetime, str, str]] = []
+
     for it in feed_items:
         post = getattr(it, "post", None)
         if not post:
@@ -320,31 +282,36 @@ def do_reposts(client: Client, state: Dict[str, Any], feed_uri: str, exclude_aut
         record = getattr(post, "record", None)
 
         if not uri or not cid or not author or not record:
+            counts["missing"] += 1
             continue
-
         if author in exclude_authors:
+            counts["excluded"] += 1
             continue
-
         if uri in already_reposted:
+            counts["already"] += 1
             continue
 
         p_time = robust_post_time(post)
         if p_time < cutoff:
+            counts["too_old"] += 1
             continue
 
-        if not has_media(record):
+        if MEDIA_ONLY and not has_media(record):
+            counts["no_media"] += 1
             continue
 
+        counts["ok"] += 1
         candidates.append((p_time, uri, cid))
 
-    # ✅ Oldest-first so newest original ends up on top (last repost is newest original)
+    print("🧪 counts:", counts)
+
+    # Oldest-first so newest original ends up top
     candidates.sort(key=lambda x: x[0])
 
     made = 0
     for p_time, uri, cid in candidates:
         if made >= MAX_PER_RUN:
             break
-
         try:
             ts = now_iso()
 
@@ -354,7 +321,6 @@ def do_reposts(client: Client, state: Dict[str, Any], feed_uri: str, exclude_aut
             )
             repost_uri = getattr(out, "uri", None)
 
-            # like only if not already liked
             if uri not in already_liked:
                 client.app.bsky.feed.like.create(
                     repo=client.me.did,
@@ -368,7 +334,6 @@ def do_reposts(client: Client, state: Dict[str, Any], feed_uri: str, exclude_aut
                 "repost_uri": repost_uri,
                 "createdAt": ts
             })
-
             already_reposted.add(uri)
 
             made += 1
@@ -379,9 +344,7 @@ def do_reposts(client: Client, state: Dict[str, Any], feed_uri: str, exclude_aut
             print(f"⚠️ Error for {uri}: {e}")
             time.sleep(2)
 
-    # cache for next runs
     update_seen_cache(state, already_reposted, already_liked)
-
     return made
 
 # ================== MAIN ==================
@@ -397,7 +360,6 @@ def main():
 
     state = load_state(STATE_FILE)
 
-    # Load exclude list members
     exclude_authors: Set[str] = set()
     if EXCLUDE_LIST_LINK:
         ex_uri = normalize_list_uri(client, EXCLUDE_LIST_LINK)
@@ -409,10 +371,8 @@ def main():
     else:
         print("ℹ️ No EXCLUDE_LIST_LINK set; exclude list is empty")
 
-    # Cleanup old reposts
     removed = cleanup_old_reposts(client, state)
 
-    # Feed -> repost + like
     feed_uri = normalize_feed_uri(client, FEED_LINK)
     if not feed_uri:
         print("❌ FEED_LINK invalid / could not normalize.")
