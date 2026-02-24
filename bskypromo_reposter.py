@@ -2,311 +2,362 @@ from atproto import Client
 import os
 import re
 import time
+import json
+import sys
 from datetime import datetime, timedelta, timezone
-from typing import Optional, List, Set, Tuple
+from typing import Optional, Dict, List, Set, Tuple
 
-# ================== ENV ==================
+# Github Actions: print direct
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+except Exception:
+    pass
 
-BSKY_USERNAME = os.getenv("BSKY_USERNAME")
-BSKY_PASSWORD = os.getenv("BSKY_PASSWORD")
+print("=== BSKYPROMO HASHTAG BOT STARTED ===", flush=True)
 
-FEED_LINK = os.getenv(
-    "FEED_LINK",
-    "https://bsky.app/profile/did:plc:jaka644beit3x4vmmg6yysw7/feed/aaaipcjvdtvu4",
-)
+# ============================================================
+# CONFIG — leeg = skip (structuur blijft bestaan)
+# ============================================================
 
-EXCLUDE_LIST_LINK = os.getenv(
-    "EXCLUDE_LIST_LINK",
-    "https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkghzcmt72w",
-)
+FEEDS = {
+    "feed 1": {"link": "", "note": ""},
+    "feed 2": {"link": "", "note": ""},
+    "feed 3": {"link": "", "note": ""},
+    "feed 4": {"link": "", "note": ""},
+    "feed 5": {"link": "", "note": ""},
+}
 
-MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "100"))
-POST_DELAY_SECONDS = float(os.getenv("POST_DELAY_SECONDS", "1.2"))
+LIJSTEN = {
+    "lijst 1": {"link": "", "note": ""},
+    "lijst 2": {"link": "", "note": ""},
+    "lijst 3": {"link": "", "note": ""},
+    "lijst 4": {"link": "", "note": ""},
+    "lijst 5": {"link": "", "note": ""},
+}
 
-# Set HOURS_BACK=0 to ignore age completely (recommended if feed "reshuffles" old posts)
-HOURS_BACK = int(os.getenv("HOURS_BACK", "4"))
+EXCLUDE_LISTS = {
+    # leeg = geen exclude actief
+}
 
-# Keeps reposted.txt small (removes old log lines). Does NOT delete old reposts from your profile.
-CLEANUP_DAYS = int(os.getenv("CLEANUP_DAYS", "14"))
+HASHTAG_QUERY = "#bskypromo"
 
-FEED_MAX_ITEMS = int(os.getenv("FEED_MAX_ITEMS", "1000"))
-LIST_MEMBER_LIMIT = int(os.getenv("LIST_MEMBER_LIMIT", "500"))
+PROMO_FEED_KEY = "feed 1"
+PROMO_LIST_KEY = "lijst 1"
 
-REPOST_LOG_FILE = os.getenv("REPOST_LOG_FILE", "reposted.txt")
+# ============================================================
+# RUNTIME CONFIG (env)
+# ============================================================
+HOURS_BACK = int(os.getenv("HOURS_BACK", "3"))
+MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "50"))
+MAX_PER_USER = int(os.getenv("MAX_PER_USER", "3"))
+SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "2"))
 
-# ================== REGEX ==================
+STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
-LIST_URL_RE = re.compile(r"https://bsky\.app/profile/([^/]+)/lists/([^/?#]+)", re.I)
-FEED_URL_RE = re.compile(r"https://bsky\.app/profile/([^/]+)/feed/([^/?#]+)", re.I)
+FEED_MAX_ITEMS = int(os.getenv("FEED_MAX_ITEMS", "500"))
+HASHTAG_MAX_ITEMS = int(os.getenv("HASHTAG_MAX_ITEMS", "100"))
 
-# ================== TIME ==================
+# Secrets in GitHub
+ENV_USERNAME = "BSKY_USERNAME"
+ENV_PASSWORD = "BSKY_PASSWORD"
 
-def now_dt() -> datetime:
+# ============================================================
+# REGEX (blijft staan voor compat/template; nu niet gebruikt)
+# ============================================================
+FEED_URL_RE = re.compile(r"^https?://(www\.)?bsky\.app/profile/([^/]+)/feed/([^/?#]+)", re.I)
+LIST_URL_RE = re.compile(r"^https?://(www\.)?bsky\.app/profile/([^/]+)/lists/([^/?#]+)", re.I)
+
+
+def log(msg: str):
+    print(f"[{datetime.now(timezone.utc).isoformat()}] {msg}", flush=True)
+
+
+def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
-def now_iso() -> str:
-    return now_dt().strftime("%Y-%m-%dT%H:%M:%SZ")
 
-def parse_dt(val: str) -> Optional[datetime]:
-    if not val:
-        return None
-    try:
-        return datetime.fromisoformat(val.replace("Z", "+00:00"))
-    except Exception:
-        return None
+def parse_time(post) -> Optional[datetime]:
+    indexed = getattr(post, "indexedAt", None) or getattr(post, "indexed_at", None)
+    if indexed:
+        try:
+            return datetime.fromisoformat(indexed.replace("Z", "+00:00"))
+        except Exception:
+            pass
 
-def robust_post_time(post) -> datetime:
     record = getattr(post, "record", None)
-    created = getattr(record, "createdAt", None) if record else None
-    dt = parse_dt(created) if created else None
-    if dt:
-        return dt
-    indexed = getattr(post, "indexedAt", None)
-    dt2 = parse_dt(indexed) if indexed else None
-    if dt2:
-        return dt2
-    return datetime(1970, 1, 1, tzinfo=timezone.utc)
+    if record:
+        created = getattr(record, "createdAt", None) or getattr(record, "created_at", None)
+        if created:
+            try:
+                return datetime.fromisoformat(created.replace("Z", "+00:00"))
+            except Exception:
+                pass
+    return None
 
-# ================== reposted.txt ==================
 
-def load_reposted_log(path: str) -> Set[str]:
-    if not os.path.exists(path):
-        return set()
-    out = set()
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            # format: "ISO_TIMESTAMP\tPOST_URI"
-            parts = line.split("\t", 1)
-            if len(parts) == 2:
-                out.add(parts[1].strip())
-            else:
-                out.add(parts[0].strip())
-    return out
-
-def cleanup_reposted_log(path: str, days: int) -> None:
-    if not os.path.exists(path):
-        return
-    cutoff = now_dt() - timedelta(days=days)
-    kept_lines = []
-    with open(path, "r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            parts = line.split("\t", 1)
-            if len(parts) != 2:
-                # legacy line without timestamp: keep it
-                kept_lines.append(line)
-                continue
-            ts, uri = parts[0].strip(), parts[1].strip()
-            dt = parse_dt(ts)
-            if not dt or dt >= cutoff:
-                kept_lines.append(f"{ts}\t{uri}")
-
-    with open(path, "w", encoding="utf-8") as f:
-        for l in kept_lines:
-            f.write(l + "\n")
-
-def append_reposted(path: str, uri: str) -> None:
-    with open(path, "a", encoding="utf-8") as f:
-        f.write(f"{now_iso()}\t{uri}\n")
-
-# ================== URI NORMALIZERS ==================
-
-def resolve_handle_to_did(client: Client, actor: str) -> Optional[str]:
-    if actor.startswith("did:"):
-        return actor
-    try:
-        out = client.com.atproto.identity.resolve_handle({"handle": actor})
-        return getattr(out, "did", None)
-    except Exception:
-        return None
-
-def normalize_list_uri(client: Client, link: str) -> Optional[str]:
-    if not link:
-        return None
-    if link.startswith("at://"):
-        return link
-    m = LIST_URL_RE.match(link)
-    if not m:
-        return None
-    did = resolve_handle_to_did(client, m.group(1))
-    if not did:
-        return None
-    return f"at://{did}/app.bsky.graph.list/{m.group(2)}"
-
-def normalize_feed_uri(client: Client, link: str) -> Optional[str]:
-    if not link:
-        return None
-    if link.startswith("at://"):
-        return link
-    m = FEED_URL_RE.match(link)
-    if not m:
-        return None
-    did = resolve_handle_to_did(client, m.group(1))
-    if not did:
-        return None
-    return f"at://{did}/app.bsky.feed.generator/{m.group(2)}"
-
-# ================== FETCHERS ==================
-
-def fetch_list_members(client: Client, list_uri: str, limit: int) -> List[str]:
-    members, cursor = [], None
-    while True:
-        params = {"list": list_uri, "limit": 100}
-        if cursor:
-            params["cursor"] = cursor
-        out = client.app.bsky.graph.get_list(params)
-        for it in getattr(out, "items", []) or []:
-            subj = getattr(it, "subject", None)
-            did = getattr(subj, "did", None) if subj else None
-            if did:
-                members.append(did)
-            if len(members) >= limit:
-                return members[:limit]
-        cursor = getattr(out, "cursor", None)
-        if not cursor:
-            break
-    return members[:limit]
-
-def fetch_feed_items(client: Client, feed_uri: str, max_items: int) -> List:
-    items, cursor = [], None
-    while len(items) < max_items:
-        batch_limit = min(100, max_items - len(items))
-        if batch_limit <= 0:
-            break
-        params = {"feed": feed_uri, "limit": batch_limit}
-        if cursor:
-            params["cursor"] = cursor
-        out = client.app.bsky.feed.get_feed(params)
-        batch = getattr(out, "feed", []) or []
-        items.extend(batch)
-        cursor = getattr(out, "cursor", None)
-        if not cursor or not batch:
-            break
-    return items[:max_items]
-
-# ================== MEDIA CHECK ==================
-
-def has_media(record) -> bool:
+def is_quote_post(record) -> bool:
     embed = getattr(record, "embed", None)
     if not embed:
         return False
+    return bool(getattr(embed, "record", None) or getattr(embed, "recordWithMedia", None))
+
+
+def has_media(record) -> bool:
+    """
+    Alleen echte media: images/video.
+    External-only (link-card) telt NIET als media.
+    """
+    embed = getattr(record, "embed", None)
+    if not embed:
+        return False
+
     if getattr(embed, "images", None):
         return True
     if getattr(embed, "video", None):
         return True
+
+    if getattr(embed, "external", None):
+        return False
+
     rwm = getattr(embed, "recordWithMedia", None)
-    if rwm:
-        media = getattr(rwm, "media", None)
-        if media:
-            if getattr(media, "images", None):
-                return True
-            if getattr(media, "video", None):
-                return True
+    if rwm and getattr(rwm, "media", None):
+        m = rwm.media
+        if getattr(m, "images", None):
+            return True
+        if getattr(m, "video", None):
+            return True
+
     return False
 
-# ================== MAIN ==================
+
+def load_state(path: str) -> Dict:
+    if not os.path.exists(path):
+        return {"repost_records": {}, "like_records": {}}
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def save_state(path: str, state: Dict) -> None:
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f, ensure_ascii=False, indent=2)
+    os.replace(tmp, path)
+
+
+def fetch_hashtag_posts(client: Client, max_items: int) -> List:
+    try:
+        out = client.app.bsky.feed.search_posts({"q": HASHTAG_QUERY, "sort": "latest", "limit": max_items})
+        return getattr(out, "posts", []) or []
+    except Exception:
+        return []
+
+
+def parse_at_uri_rkey(uri: str) -> Optional[Tuple[str, str, str]]:
+    if not uri or not uri.startswith("at://"):
+        return None
+    parts = uri[len("at://"):].split("/")
+    if len(parts) < 3:
+        return None
+    return parts[0], parts[1], parts[2]
+
+
+def force_unrepost_unlike_if_needed(
+    client: Client,
+    me: str,
+    subject_uri: str,
+    repost_records: Dict[str, str],
+    like_records: Dict[str, str],
+):
+    # unrepost
+    if subject_uri in repost_records:
+        existing_repost_uri = repost_records.get(subject_uri)
+        parsed = parse_at_uri_rkey(existing_repost_uri) if existing_repost_uri else None
+        if parsed:
+            did, collection, rkey = parsed
+            if did == me and collection == "app.bsky.feed.repost":
+                try:
+                    client.app.bsky.feed.repost.delete({"repo": me, "rkey": rkey})
+                except Exception as e:
+                    log(f"⚠️ unrepost failed: {e}")
+        repost_records.pop(subject_uri, None)
+
+    # unlike
+    if subject_uri in like_records:
+        existing_like_uri = like_records.get(subject_uri)
+        parsed = parse_at_uri_rkey(existing_like_uri) if existing_like_uri else None
+        if parsed:
+            did, collection, rkey = parsed
+            if did == me and collection == "app.bsky.feed.like":
+                try:
+                    client.app.bsky.feed.like.delete({"repo": me, "rkey": rkey})
+                except Exception as e:
+                    log(f"⚠️ unlike failed: {e}")
+        like_records.pop(subject_uri, None)
+
+
+def repost_and_like(
+    client: Client,
+    me: str,
+    subject_uri: str,
+    subject_cid: str,
+    repost_records: Dict[str, str],
+    like_records: Dict[str, str],
+    force_refresh: bool,
+) -> bool:
+    # In hashtag-only mode is force_refresh standaard False,
+    # maar we houden de functie template-compatibel.
+    if force_refresh:
+        force_unrepost_unlike_if_needed(client, me, subject_uri, repost_records, like_records)
+    else:
+        if subject_uri in repost_records:
+            return False
+
+    # repost
+    try:
+        out = client.app.bsky.feed.repost.create(
+            repo=me,
+            record={
+                "subject": {"uri": subject_uri, "cid": subject_cid},
+                "createdAt": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+        repost_uri = getattr(out, "uri", None)
+        if repost_uri:
+            repost_records[subject_uri] = repost_uri
+    except Exception as e:
+        log(f"⚠️ Repost error: {e}")
+        return False
+
+    # like
+    try:
+        out_like = client.app.bsky.feed.like.create(
+            repo=me,
+            record={
+                "subject": {"uri": subject_uri, "cid": subject_cid},
+                "createdAt": utcnow().strftime("%Y-%m-%dT%H:%M:%SZ"),
+            },
+        )
+        like_uri = getattr(out_like, "uri", None)
+        if like_uri:
+            like_records[subject_uri] = like_uri
+    except Exception as e:
+        log(f"⚠️ Like error: {e}")
+
+    return True
+
 
 def main():
-    if not BSKY_USERNAME or not BSKY_PASSWORD:
-        print("❌ Missing BSKY_USERNAME / BSKY_PASSWORD")
+    log("=== BSKYPROMO HASHTAG BOT START ===")
+
+    username = os.getenv(ENV_USERNAME, "").strip()
+    password = os.getenv(ENV_PASSWORD, "").strip()
+    if not username or not password:
+        log(f"❌ Missing env {ENV_USERNAME} / {ENV_PASSWORD}")
         return
+
+    cutoff = utcnow() - timedelta(hours=HOURS_BACK)
+
+    state = load_state(STATE_FILE)
+    repost_records: Dict[str, str] = state.get("repost_records", {})
+    like_records: Dict[str, str] = state.get("like_records", {})
 
     client = Client()
-    client.login(BSKY_USERNAME, BSKY_PASSWORD)
-    print(f"✅ Logged in as {client.me.did}")
+    client.login(username, password)
+    me = client.me.did
+    log(f"✅ Logged in as {me}")
 
-    # cleanup reposted.txt (keeps file small)
-    cleanup_reposted_log(REPOST_LOG_FILE, CLEANUP_DAYS)
+    # Template-compat logs (feeds/lijsten bestaan maar zijn leeg)
+    log("Feeds to process: 0 (all empty)")
+    log("Lists to process: 0 (all empty)")
 
-    done = load_reposted_log(REPOST_LOG_FILE)
-    print(f"🧾 Loaded {len(done)} reposted URIs from {REPOST_LOG_FILE}")
+    # Hashtag
+    log(f"🔎 Hashtag search: {HASHTAG_QUERY}")
+    posts = fetch_hashtag_posts(client, HASHTAG_MAX_ITEMS)
+    log(f"Hashtag posts fetched: {len(posts)}")
 
-    # Exclude list
-    exclude_dids: Set[str] = set()
-    if EXCLUDE_LIST_LINK:
-        ex_uri = normalize_list_uri(client, EXCLUDE_LIST_LINK)
-        if not ex_uri:
-            print("❌ EXCLUDE_LIST_LINK invalid")
-            return
-        exclude_dids = set(fetch_list_members(client, ex_uri, LIST_MEMBER_LIMIT))
-        print(f"🚫 Loaded {len(exclude_dids)} excluded authors")
-
-    # Feed
-    feed_uri = normalize_feed_uri(client, FEED_LINK)
-    if not feed_uri:
-        print("❌ FEED_LINK invalid")
-        return
-
-    cutoff = now_dt() - timedelta(hours=HOURS_BACK) if HOURS_BACK > 0 else None
-
-    feed_items = fetch_feed_items(client, feed_uri, FEED_MAX_ITEMS)
-    print(f"🧲 Feed items fetched: {len(feed_items)}")
-
-    candidates: List[Tuple[datetime, str, str]] = []
-    for it in feed_items:
-        post = getattr(it, "post", None)
-        if not post:
-            continue
-
-        uri = getattr(post, "uri", None)
-        cid = getattr(post, "cid", None)
-        author = getattr(getattr(post, "author", None), "did", None)
+    # Build candidates
+    candidates: List[Dict] = []
+    for post in posts:
         record = getattr(post, "record", None)
-
-        if not uri or not cid or not author or not record:
+        if not record:
             continue
 
-        if author in exclude_dids:
+        if getattr(record, "reply", None):
             continue
 
-        if uri in done:
-            continue
-
-        p_time = robust_post_time(post)
-        if cutoff and p_time < cutoff:
+        if is_quote_post(record):
             continue
 
         if not has_media(record):
             continue
 
-        candidates.append((p_time, uri, cid))
+        uri = getattr(post, "uri", None)
+        cid = getattr(post, "cid", None)
+        if not uri or not cid:
+            continue
 
-    # Oldest -> newest (so newest ends up on top after the run)
-    candidates.sort(key=lambda x: x[0])
+        created = parse_time(post)
+        if not created or created < cutoff:
+            continue
 
-    made = 0
-    for p_time, uri, cid in candidates:
-        if made >= MAX_PER_RUN:
+        author = getattr(post, "author", None)
+        ah = (getattr(author, "handle", "") or "").lower()
+        ad = (getattr(author, "did", "") or "").lower()
+
+        candidates.append({
+            "uri": uri,
+            "cid": cid,
+            "created": created,
+            "author_key": ad or ah or uri,
+            "force_refresh": False,
+        })
+
+    # Dedup + oldest-first
+    seen: Set[str] = set()
+    deduped: List[Dict] = []
+    for c in sorted(candidates, key=lambda x: x["created"]):
+        if c["uri"] in seen:
+            continue
+        seen.add(c["uri"])
+        deduped.append(c)
+
+    log(f"🧩 Candidates total (deduped): {len(deduped)}")
+
+    total_done = 0
+    per_user_count: Dict[str, int] = {}
+
+    for c in deduped:
+        if total_done >= MAX_PER_RUN:
             break
-        try:
-            ts = now_iso()
 
-            client.app.bsky.feed.repost.create(
-                repo=client.me.did,
-                record={"subject": {"uri": uri, "cid": cid}, "createdAt": ts},
-            )
-            client.app.bsky.feed.like.create(
-                repo=client.me.did,
-                record={"subject": {"uri": uri, "cid": cid}, "createdAt": ts},
-            )
+        ak = c["author_key"]
+        per_user_count.setdefault(ak, 0)
 
-            append_reposted(REPOST_LOG_FILE, uri)
-            done.add(uri)
-            made += 1
+        if per_user_count[ak] >= MAX_PER_USER:
+            continue
 
-            print(f"✅ Reposted+liked: {uri} | post_time={p_time.isoformat()}")
-            time.sleep(POST_DELAY_SECONDS)
+        ok = repost_and_like(
+            client, me, c["uri"], c["cid"],
+            repost_records, like_records,
+            force_refresh=False
+        )
+        if ok:
+            total_done += 1
+            per_user_count[ak] += 1
+            log(f"✅ Repost+Like: {c['uri']}")
+            time.sleep(SLEEP_SECONDS)
 
-        except Exception as e:
-            print(f"⚠️ Error for {uri}: {e}")
-            time.sleep(2)
+    state["repost_records"] = repost_records
+    state["like_records"] = like_records
+    save_state(STATE_FILE, state)
+    log(f"🔥 Done — total reposts this run: {total_done}")
 
-    print(f"🔥 Done — reposted: {made}")
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import traceback
+        print("=== FATAL ERROR ===", flush=True)
+        traceback.print_exc()
+        raise
