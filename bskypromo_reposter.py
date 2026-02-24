@@ -35,10 +35,12 @@ LIJSTEN = {
     "lijst 5": {"link": "", "note": ""},
 }
 
-EXCLUDE_LISTS = {"https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkghzcmt72w": "", "Bskypromopause": ""},
-    # leeg = geen exclude actief
+EXCLUDE_LISTS = {
+    "exclude 1": {
+        "link": "https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkghzcmt72w",
+        "note": "Bskypromopause",
+    }
 }
-
 HASHTAG_QUERY = "#bskypromo"
 
 PROMO_FEED_KEY = "feed 1"
