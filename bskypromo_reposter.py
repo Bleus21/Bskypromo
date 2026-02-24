@@ -13,10 +13,10 @@ try:
 except Exception:
     pass
 
-print("=== BSKYPROMO HASHTAG BOT STARTED ===", flush=True)
+print("=== BSKYPROMO BOT STARTED ===", flush=True)
 
 # ============================================================
-# CONFIG — leeg = skip (structuur blijft bestaan)
+# CONFIG — leeg = skip
 # ============================================================
 
 FEEDS = {
@@ -27,20 +27,26 @@ FEEDS = {
     "feed 5": {"link": "", "note": ""},
 }
 
+# ✅ LIST FIX: altijd {"link": "...", "note": "..."}
 LIJSTEN = {
-    "lijst 1": {"https://bsky.app/profile/did:plc:jaka644beit3x4vmmg6yysw7/lists/3mfn7tdmxkz2l": "", "beautygroup promo": ""},
+    "lijst 1": {
+        "link": "https://bsky.app/profile/did:plc:jaka644beit3x4vmmg6yysw7/lists/3mfn7tdmxkz2l",
+        "note": "beautygroup promo",
+    },
     "lijst 2": {"link": "", "note": ""},
     "lijst 3": {"link": "", "note": ""},
     "lijst 4": {"link": "", "note": ""},
     "lijst 5": {"link": "", "note": ""},
 }
 
+# ✅ EXCLUDE werkt nu ook voor hashtag posts
 EXCLUDE_LISTS = {
     "exclude 1": {
         "link": "https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkghzcmt72w",
         "note": "Bskypromopause",
     }
 }
+
 HASHTAG_QUERY = "#bskypromo"
 
 PROMO_FEED_KEY = "feed 1"
@@ -56,6 +62,8 @@ SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "2"))
 
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
+LIST_MEMBER_LIMIT = int(os.getenv("LIST_MEMBER_LIMIT", "1500"))
+AUTHOR_POSTS_PER_MEMBER = int(os.getenv("AUTHOR_POSTS_PER_MEMBER", "10"))
 FEED_MAX_ITEMS = int(os.getenv("FEED_MAX_ITEMS", "500"))
 HASHTAG_MAX_ITEMS = int(os.getenv("HASHTAG_MAX_ITEMS", "100"))
 
@@ -64,7 +72,7 @@ ENV_USERNAME = "BSKY_USERNAME"
 ENV_PASSWORD = "BSKY_PASSWORD"
 
 # ============================================================
-# REGEX (blijft staan voor compat/template; nu niet gebruikt)
+# REGEX
 # ============================================================
 FEED_URL_RE = re.compile(r"^https?://(www\.)?bsky\.app/profile/([^/]+)/feed/([^/?#]+)", re.I)
 LIST_URL_RE = re.compile(r"^https?://(www\.)?bsky\.app/profile/([^/]+)/lists/([^/?#]+)", re.I)
@@ -132,6 +140,50 @@ def has_media(record) -> bool:
     return False
 
 
+def resolve_handle_to_did(client: Client, actor: str) -> Optional[str]:
+    if actor.startswith("did:"):
+        return actor
+    try:
+        out = client.com.atproto.identity.resolve_handle({"handle": actor})
+        return getattr(out, "did", None)
+    except Exception:
+        return None
+
+
+def normalize_feed_uri(client: Client, s: str) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip()
+    if s.startswith("at://") and "/app.bsky.feed.generator/" in s:
+        return s
+    m = FEED_URL_RE.match(s)
+    if not m:
+        return None
+    actor = m.group(2)
+    rkey = m.group(3)
+    did = resolve_handle_to_did(client, actor)
+    if not did:
+        return None
+    return f"at://{did}/app.bsky.feed.generator/{rkey}"
+
+
+def normalize_list_uri(client: Client, s: str) -> Optional[str]:
+    if not s:
+        return None
+    s = s.strip()
+    if s.startswith("at://") and "/app.bsky.graph.list/" in s:
+        return s
+    m = LIST_URL_RE.match(s)
+    if not m:
+        return None
+    actor = m.group(2)
+    rkey = m.group(3)
+    did = resolve_handle_to_did(client, actor)
+    if not did:
+        return None
+    return f"at://{did}/app.bsky.graph.list/{rkey}"
+
+
 def load_state(path: str) -> Dict:
     if not os.path.exists(path):
         return {"repost_records": {}, "like_records": {}}
@@ -146,6 +198,64 @@ def save_state(path: str, state: Dict) -> None:
     os.replace(tmp, path)
 
 
+def parse_at_uri_rkey(uri: str) -> Optional[Tuple[str, str, str]]:
+    if not uri or not uri.startswith("at://"):
+        return None
+    parts = uri[len("at://"):].split("/")
+    if len(parts) < 3:
+        return None
+    return parts[0], parts[1], parts[2]
+
+
+def fetch_feed_items(client: Client, feed_uri: str, max_items: int) -> List:
+    items: List = []
+    cursor = None
+    while True:
+        params = {"feed": feed_uri, "limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        out = client.app.bsky.feed.get_feed(params)
+        batch = getattr(out, "feed", []) or []
+        items.extend(batch)
+        cursor = getattr(out, "cursor", None)
+        if not cursor or len(items) >= max_items:
+            break
+    return items[:max_items]
+
+
+def fetch_list_members(client: Client, list_uri: str, limit: int) -> List[Tuple[str, str]]:
+    members: List[Tuple[str, str]] = []
+    cursor = None
+    while True:
+        params = {"list": list_uri, "limit": 100}
+        if cursor:
+            params["cursor"] = cursor
+        out = client.app.bsky.graph.get_list(params)
+        items = getattr(out, "items", []) or []
+        for it in items:
+            subj = getattr(it, "subject", None)
+            if not subj:
+                continue
+            h = (getattr(subj, "handle", "") or "").lower()
+            d = (getattr(subj, "did", "") or "").lower()
+            if h or d:
+                members.append((h, d))
+            if len(members) >= limit:
+                return members[:limit]
+        cursor = getattr(out, "cursor", None)
+        if not cursor:
+            break
+    return members[:limit]
+
+
+def fetch_author_feed(client: Client, actor: str, limit: int) -> List:
+    try:
+        out = client.app.bsky.feed.get_author_feed({"actor": actor, "limit": limit})
+        return getattr(out, "feed", []) or []
+    except Exception:
+        return []
+
+
 def fetch_hashtag_posts(client: Client, max_items: int) -> List:
     try:
         out = client.app.bsky.feed.search_posts({"q": HASHTAG_QUERY, "sort": "latest", "limit": max_items})
@@ -154,13 +264,111 @@ def fetch_hashtag_posts(client: Client, max_items: int) -> List:
         return []
 
 
-def parse_at_uri_rkey(uri: str) -> Optional[Tuple[str, str, str]]:
-    if not uri or not uri.startswith("at://"):
-        return None
-    parts = uri[len("at://"):].split("/")
-    if len(parts) < 3:
-        return None
-    return parts[0], parts[1], parts[2]
+def build_candidates_from_feed_items(
+    items: List,
+    cutoff: datetime,
+    exclude_handles: Set[str],
+    exclude_dids: Set[str],
+    force_refresh: bool,
+) -> List[Dict]:
+    cands: List[Dict] = []
+    for item in items:
+        post = getattr(item, "post", None)
+        if not post:
+            continue
+
+        # skip boosts/reposts
+        if hasattr(item, "reason") and item.reason is not None:
+            continue
+
+        record = getattr(post, "record", None)
+        if not record:
+            continue
+
+        if getattr(record, "reply", None):
+            continue
+
+        if is_quote_post(record):
+            continue
+
+        if not has_media(record):
+            continue
+
+        uri = getattr(post, "uri", None)
+        cid = getattr(post, "cid", None)
+        if not uri or not cid:
+            continue
+
+        author = getattr(post, "author", None)
+        ah = (getattr(author, "handle", "") or "").lower()
+        ad = (getattr(author, "did", "") or "").lower()
+
+        if ah in exclude_handles or ad in exclude_dids:
+            continue
+
+        created = parse_time(post)
+        if not created or created < cutoff:
+            continue
+
+        cands.append({
+            "uri": uri,
+            "cid": cid,
+            "created": created,
+            "author_key": ad or ah or uri,
+            "force_refresh": force_refresh,
+        })
+
+    cands.sort(key=lambda x: x["created"])
+    return cands
+
+
+def build_candidates_from_postviews(
+    posts: List,
+    cutoff: datetime,
+    exclude_handles: Set[str],
+    exclude_dids: Set[str],
+) -> List[Dict]:
+    cands: List[Dict] = []
+    for post in posts:
+        record = getattr(post, "record", None)
+        if not record:
+            continue
+
+        if getattr(record, "reply", None):
+            continue
+
+        if is_quote_post(record):
+            continue
+
+        if not has_media(record):
+            continue
+
+        uri = getattr(post, "uri", None)
+        cid = getattr(post, "cid", None)
+        if not uri or not cid:
+            continue
+
+        author = getattr(post, "author", None)
+        ah = (getattr(author, "handle", "") or "").lower()
+        ad = (getattr(author, "did", "") or "").lower()
+
+        if ah in exclude_handles or ad in exclude_dids:
+            continue
+
+        created = parse_time(post)
+        if not created or created < cutoff:
+            continue
+
+        cands.append({
+            "uri": uri,
+            "cid": cid,
+            "created": created,
+            "author_key": ad or ah or uri,
+            "force_refresh": False,
+        })
+
+    cands.sort(key=lambda x: x["created"])
+    return cands
 
 
 def force_unrepost_unlike_if_needed(
@@ -206,8 +414,6 @@ def repost_and_like(
     like_records: Dict[str, str],
     force_refresh: bool,
 ) -> bool:
-    # In hashtag-only mode is force_refresh standaard False,
-    # maar we houden de functie template-compatibel.
     if force_refresh:
         force_unrepost_unlike_if_needed(client, me, subject_uri, repost_records, like_records)
     else:
@@ -249,7 +455,7 @@ def repost_and_like(
 
 
 def main():
-    log("=== BSKYPROMO HASHTAG BOT START ===")
+    log("=== BSKYPROMO BOT START ===")
 
     username = os.getenv(ENV_USERNAME, "").strip()
     password = os.getenv(ENV_PASSWORD, "").strip()
@@ -268,84 +474,135 @@ def main():
     me = client.me.did
     log(f"✅ Logged in as {me}")
 
-    # Template-compat logs (feeds/lijsten bestaan maar zijn leeg)
-    log("Feeds to process: 0 (all empty)")
-    log("Lists to process: 0 (all empty)")
+    # normalize feeds
+    feed_uris: List[Tuple[str, str, str]] = []
+    for key, obj in FEEDS.items():
+        link = (obj.get("link") or "").strip()
+        note = (obj.get("note") or "").strip()
+        if not link:
+            continue
+        uri = normalize_feed_uri(client, link)
+        if uri:
+            feed_uris.append((key, note, uri))
+        else:
+            log(f"⚠️ Feed ongeldig (skip): {key} -> {link}")
 
-    # Hashtag
+    # normalize lists
+    list_uris: List[Tuple[str, str, str]] = []
+    for key, obj in LIJSTEN.items():
+        link = (obj.get("link") or "").strip()
+        note = (obj.get("note") or "").strip()
+        if not link:
+            continue
+        uri = normalize_list_uri(client, link)
+        if uri:
+            list_uris.append((key, note, uri))
+        else:
+            log(f"⚠️ Lijst ongeldig (skip): {key} -> {link}")
+
+    # normalize exclude
+    excl_uris: List[Tuple[str, str, str]] = []
+    for key, obj in EXCLUDE_LISTS.items():
+        link = (obj.get("link") or "").strip()
+        note = (obj.get("note") or "").strip()
+        if not link:
+            continue
+        uri = normalize_list_uri(client, link)
+        if uri:
+            excl_uris.append((key, note, uri))
+        else:
+            log(f"⚠️ Exclude lijst ongeldig (skip): {key} -> {link}")
+
+    # build exclude sets
+    exclude_handles: Set[str] = set()
+    exclude_dids: Set[str] = set()
+    for key, note, luri in excl_uris:
+        log(f"🚫 Loading exclude list: {key} ({note})")
+        members = fetch_list_members(client, luri, limit=max(1000, LIST_MEMBER_LIMIT))
+        log(f"🚫 Exclude members: {len(members)}")
+        for h, d in members:
+            if h:
+                exclude_handles.add(h.lower())
+            if d:
+                exclude_dids.add(d.lower())
+
+    # promo sort
+    def promo_sort(item: Tuple[str, str, str], promo_key: str) -> int:
+        return 0 if item[0] == promo_key else 1
+
+    feed_uris.sort(key=lambda x: promo_sort(x, PROMO_FEED_KEY))
+    list_uris.sort(key=lambda x: promo_sort(x, PROMO_LIST_KEY))
+
+    all_candidates: List[Dict] = []
+
+    # feeds
+    log(f"Feeds to process: {len(feed_uris)}")
+    for key, note, furi in feed_uris:
+        is_promo = (key == PROMO_FEED_KEY)
+        log(f"📥 Feed: {key} ({note})" + (" [PROMO]" if is_promo else ""))
+        items = fetch_feed_items(client, furi, max_items=FEED_MAX_ITEMS)
+        all_candidates.extend(
+            build_candidates_from_feed_items(items, cutoff, exclude_handles, exclude_dids, force_refresh=is_promo)
+        )
+
+    # lists
+    log(f"Lists to process: {len(list_uris)}")
+    for key, note, luri in list_uris:
+        is_promo = (key == PROMO_LIST_KEY)
+        log(f"📋 List: {key} ({note})" + (" [PROMO]" if is_promo else ""))
+        members = fetch_list_members(client, luri, limit=max(1000, LIST_MEMBER_LIMIT))
+        log(f"👥 Members fetched: {len(members)}")
+        for (h, d) in members:
+            actor = d or h
+            if not actor:
+                continue
+            author_items = fetch_author_feed(client, actor, AUTHOR_POSTS_PER_MEMBER)
+            all_candidates.extend(
+                build_candidates_from_feed_items(
+                    author_items, cutoff, exclude_handles, exclude_dids, force_refresh=is_promo
+                )
+            )
+
+    # hashtag (exclude applied here too)
     log(f"🔎 Hashtag search: {HASHTAG_QUERY}")
-    posts = fetch_hashtag_posts(client, HASHTAG_MAX_ITEMS)
-    log(f"Hashtag posts fetched: {len(posts)}")
+    hashtag_posts = fetch_hashtag_posts(client, HASHTAG_MAX_ITEMS)
+    log(f"Hashtag posts fetched: {len(hashtag_posts)}")
+    all_candidates.extend(
+        build_candidates_from_postviews(hashtag_posts, cutoff, exclude_handles, exclude_dids)
+    )
 
-    # Build candidates
-    candidates: List[Dict] = []
-    for post in posts:
-        record = getattr(post, "record", None)
-        if not record:
-            continue
-
-        if getattr(record, "reply", None):
-            continue
-
-        if is_quote_post(record):
-            continue
-
-        if not has_media(record):
-            continue
-
-        uri = getattr(post, "uri", None)
-        cid = getattr(post, "cid", None)
-        if not uri or not cid:
-            continue
-
-        created = parse_time(post)
-        if not created or created < cutoff:
-            continue
-
-        author = getattr(post, "author", None)
-        ah = (getattr(author, "handle", "") or "").lower()
-        ad = (getattr(author, "did", "") or "").lower()
-
-        candidates.append({
-            "uri": uri,
-            "cid": cid,
-            "created": created,
-            "author_key": ad or ah or uri,
-            "force_refresh": False,
-        })
-
-    # Dedup + oldest-first
+    # dedupe + sort
     seen: Set[str] = set()
-    deduped: List[Dict] = []
-    for c in sorted(candidates, key=lambda x: x["created"]):
+    candidates: List[Dict] = []
+    for c in sorted(all_candidates, key=lambda x: x["created"]):
         if c["uri"] in seen:
             continue
         seen.add(c["uri"])
-        deduped.append(c)
+        candidates.append(c)
 
-    log(f"🧩 Candidates total (deduped): {len(deduped)}")
+    log(f"🧩 Candidates total (deduped): {len(candidates)}")
 
     total_done = 0
     per_user_count: Dict[str, int] = {}
 
-    for c in deduped:
+    for c in candidates:
         if total_done >= MAX_PER_RUN:
             break
 
         ak = c["author_key"]
         per_user_count.setdefault(ak, 0)
 
-        if per_user_count[ak] >= MAX_PER_USER:
+        # per-user limit geldt voor normale posts; promo refresh mag altijd
+        if per_user_count[ak] >= MAX_PER_USER and not c.get("force_refresh"):
             continue
 
         ok = repost_and_like(
-            client, me, c["uri"], c["cid"],
-            repost_records, like_records,
-            force_refresh=False
+            client, me, c["uri"], c["cid"], repost_records, like_records, force_refresh=bool(c.get("force_refresh"))
         )
         if ok:
             total_done += 1
-            per_user_count[ak] += 1
+            if not c.get("force_refresh"):
+                per_user_count[ak] += 1
             log(f"✅ Repost+Like: {c['uri']}")
             time.sleep(SLEEP_SECONDS)
 
@@ -357,6 +614,7 @@ def main():
 
 if __name__ == "__main__":
     try:
+        print("=== ABOUT TO CALL MAIN ===", flush=True)
         main()
     except Exception:
         import traceback
