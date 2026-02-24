@@ -20,7 +20,7 @@ print("=== BSKYPROMO BOT STARTED ===", flush=True)
 # ============================================================
 
 FEEDS = {
-    "feed 1": {"link": "", "note": ""},
+    "feed 1": {"link": "", "note": "PROMO (bovenaan)"},
     "feed 2": {"link": "", "note": ""},
     "feed 3": {"link": "", "note": ""},
     "feed 4": {"link": "", "note": ""},
@@ -39,7 +39,7 @@ LIJSTEN = {
     "lijst 5": {"link": "", "note": ""},
 }
 
-# ✅ EXCLUDE werkt nu ook voor hashtag posts
+# ✅ EXCLUDE toegepast op alle bronnen (ook hashtag)
 EXCLUDE_LISTS = {
     "exclude 1": {
         "link": "https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkghzcmt72w",
@@ -271,6 +271,9 @@ def build_candidates_from_feed_items(
     exclude_dids: Set[str],
     force_refresh: bool,
 ) -> List[Dict]:
+    """
+    force_refresh=True (PROMO): cutoff wordt genegeerd -> posts mogen ouder zijn dan HOURS_BACK.
+    """
     cands: List[Dict] = []
     for item in items:
         post = getattr(item, "post", None)
@@ -307,7 +310,11 @@ def build_candidates_from_feed_items(
             continue
 
         created = parse_time(post)
-        if not created or created < cutoff:
+        if not created:
+            continue
+
+        # ✅ Alleen niet-promo moet binnen cutoff vallen
+        if created < cutoff and not force_refresh:
             continue
 
         cands.append({
@@ -328,6 +335,9 @@ def build_candidates_from_postviews(
     exclude_handles: Set[str],
     exclude_dids: Set[str],
 ) -> List[Dict]:
+    """
+    Hashtag blijft binnen cutoff.
+    """
     cands: List[Dict] = []
     for post in posts:
         record = getattr(post, "record", None)
@@ -388,7 +398,7 @@ def force_unrepost_unlike_if_needed(
                 try:
                     client.app.bsky.feed.repost.delete({"repo": me, "rkey": rkey})
                 except Exception as e:
-                    log(f"⚠️ unrepost failed: {e}")
+                    log(f"⚠️ PROMO unrepost failed: {e}")
         repost_records.pop(subject_uri, None)
 
     # unlike
@@ -401,7 +411,7 @@ def force_unrepost_unlike_if_needed(
                 try:
                     client.app.bsky.feed.like.delete({"repo": me, "rkey": rkey})
                 except Exception as e:
-                    log(f"⚠️ unlike failed: {e}")
+                    log(f"⚠️ PROMO unlike failed: {e}")
         like_records.pop(subject_uri, None)
 
 
@@ -552,18 +562,25 @@ def main():
         log(f"📋 List: {key} ({note})" + (" [PROMO]" if is_promo else ""))
         members = fetch_list_members(client, luri, limit=max(1000, LIST_MEMBER_LIMIT))
         log(f"👥 Members fetched: {len(members)}")
+
         for (h, d) in members:
             actor = d or h
             if not actor:
                 continue
+
             author_items = fetch_author_feed(client, actor, AUTHOR_POSTS_PER_MEMBER)
-            all_candidates.extend(
-                build_candidates_from_feed_items(
-                    author_items, cutoff, exclude_handles, exclude_dids, force_refresh=is_promo
-                )
+            cands = build_candidates_from_feed_items(
+                author_items, cutoff, exclude_handles, exclude_dids, force_refresh=is_promo
             )
 
-    # hashtag (exclude applied here too)
+            if is_promo:
+                # ✅ PROMO: per member alleen de nieuwste mediapost, cutoff genegeerd door builder
+                if cands:
+                    all_candidates.append(cands[-1])
+            else:
+                all_candidates.extend(cands)
+
+    # hashtag (exclude toegepast; cutoff blijft gelden)
     log(f"🔎 Hashtag search: {HASHTAG_QUERY}")
     hashtag_posts = fetch_hashtag_posts(client, HASHTAG_MAX_ITEMS)
     log(f"Hashtag posts fetched: {len(hashtag_posts)}")
