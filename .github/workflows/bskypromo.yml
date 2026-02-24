@@ -2,7 +2,7 @@ name: Bskypromo Feed Reposter
 
 on:
   schedule:
-    - cron: "37 * * * *" # ieder uur op minuut :37 (GitHub cron = UTC)
+    - cron: "37 * * * *"
   workflow_dispatch:
 
 permissions:
@@ -11,62 +11,42 @@ permissions:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repo
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install dependencies
-        run: |
-          pip install atproto
+      - name: Install deps
+        run: pip install atproto
 
       - name: Run bot
         env:
           BSKY_USERNAME: ${{ secrets.BSKY_USERNAME }}
           BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
 
-          # ✅ FEED (bron)
           FEED_LINK: "https://bsky.app/profile/did:plc:jaka644beit3x4vmmg6yysw7/feed/aaaipcjvdtvu4"
-
-          # ✅ EXCLUDE LIST (niet reposten)
           EXCLUDE_LIST_LINK: "https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkghzcmt72w"
 
-          # ✅ Limits
           MAX_PER_RUN: "100"
           POST_DELAY_SECONDS: "1.2"
 
-          # ✅ Tijd-window + cleanup
+          # Zet HOURS_BACK op 0 als je alles wil reposten wat "nieuw in feed" is,
+          # ook als de post zelf ouder is.
           HOURS_BACK: "24"
+
           CLEANUP_DAYS: "14"
-
-          # ✅ Hoeveel feed-items hij mag binnenhalen per run
           FEED_MAX_ITEMS: "1000"
-
-          # ✅ Exclude list members max
           LIST_MEMBER_LIMIT: "500"
 
-          # ✅ Anti-dup safety
-          DUP_CHECK_AUTHOR_FEED_LIMIT: "100"
-          DUP_CHECK_CACHE: "4000"
-
-          # ✅ Debug + test switches
-          DEBUG: "1"
-          MEDIA_ONLY: "1"
-
-          # ✅ State file
-          STATE_FILE: "state.json"
-
+          REPOST_LOG_FILE: "reposted.txt"
         run: python bskypromo_reposter.py
 
-      - name: Commit state
+      - name: Commit repost log
         run: |
           git config --global user.name "github-actions"
           git config --global user.email "actions@github.com"
-          git add state.json
-          git commit -m "Update state [auto]" || echo "No changes"
+          git add reposted.txt
+          git commit -m "Update repost log [auto]" || echo "No changes"
           git push
