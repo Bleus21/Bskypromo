@@ -35,7 +35,7 @@ LIJSTEN = {
     "lijst 5": {"link": "", "note": ""},
 }
 
-EXCLUDE_LISTS = {
+EXCLUDE_LISTS = {"https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkghzcmt72w": "", "Bskypromopause": ""},
     # leeg = geen exclude actief
 }
 
