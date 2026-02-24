@@ -24,7 +24,7 @@ MAX_PER_RUN = int(os.getenv("MAX_PER_RUN", "100"))
 POST_DELAY_SECONDS = float(os.getenv("POST_DELAY_SECONDS", "1.2"))
 
 # Set HOURS_BACK=0 to ignore age completely (recommended if feed "reshuffles" old posts)
-HOURS_BACK = int(os.getenv("HOURS_BACK", "4"))
+HOURS_BACK = int(os.getenv("HOURS_BACK", "72"))
 
 # Keeps reposted.txt small (removes old log lines). Does NOT delete old reposts from your profile.
 CLEANUP_DAYS = int(os.getenv("CLEANUP_DAYS", "14"))
