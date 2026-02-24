@@ -34,7 +34,7 @@ jobs:
 
           # Zet HOURS_BACK op 0 als je alles wil reposten wat "nieuw in feed" is,
           # ook als de post zelf ouder is.
-          HOURS_BACK: "0"
+          HOURS_BACK: "4"
 
           CLEANUP_DAYS: "14"
           FEED_MAX_ITEMS: "1000"
