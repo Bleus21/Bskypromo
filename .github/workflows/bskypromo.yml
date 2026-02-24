@@ -1,9 +1,9 @@
-name: bskypromo-hashtag-bot
+name: bskypromo-bot
 
 on:
   workflow_dispatch:
   schedule:
-    - cron: "43 * * * *"   # elke uur
+    - cron: "0 * * * *" # elk uur
 
 permissions:
   contents: write
@@ -33,12 +33,17 @@ jobs:
         env:
           BSKY_USERNAME: ${{ secrets.BSKY_USERNAME }}
           BSKY_PASSWORD: ${{ secrets.BSKY_PASSWORD }}
-          # optioneel tunen:
+
           HOURS_BACK: "3"
           MAX_PER_RUN: "50"
           MAX_PER_USER: "3"
           SLEEP_SECONDS: "2"
+
           STATE_FILE: "state.json"
+
+          LIST_MEMBER_LIMIT: "1500"
+          AUTHOR_POSTS_PER_MEMBER: "30"   # ⭐ belangrijk voor “nieuwste mediapost”
+          FEED_MAX_ITEMS: "500"
           HASHTAG_MAX_ITEMS: "100"
         run: |
           python bskypromo_reposter.py
