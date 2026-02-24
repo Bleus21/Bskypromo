@@ -28,7 +28,7 @@ FEEDS = {
 }
 
 LIJSTEN = {
-    "lijst 1": {"link": "", "note": ""},
+    "lijst 1": {"https://bsky.app/profile/did:plc:jaka644beit3x4vmmg6yysw7/lists/3mfn7tdmxkz2l": "", "beautygroup promo": ""},
     "lijst 2": {"link": "", "note": ""},
     "lijst 3": {"link": "", "note": ""},
     "lijst 4": {"link": "", "note": ""},
