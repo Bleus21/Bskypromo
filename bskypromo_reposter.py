@@ -25,9 +25,13 @@ FEEDS = {
     "feed 3": {"link": "", "note": ""},
     "feed 4": {"link": "", "note": ""},
     "feed 5": {"link": "", "note": ""},
+    "feed 6": {"link": "", "note": ""},
+    "feed 7": {"link": "", "note": ""},
+    "feed 8": {"link": "", "note": ""},
+    "feed 9": {"link": "", "note": ""},
+    "feed 10": {"link": "", "note": ""},
 }
 
-# ✅ LIST FIX: altijd {"link": "...", "note": "..."}
 LIJSTEN = {
     "lijst 1": {
         "link": "https://bsky.app/profile/did:plc:jaka644beit3x4vmmg6yysw7/lists/3mfn7tdmxkz2l",
@@ -37,9 +41,14 @@ LIJSTEN = {
     "lijst 3": {"link": "", "note": ""},
     "lijst 4": {"link": "", "note": ""},
     "lijst 5": {"link": "", "note": ""},
+    "lijst 6": {"link": "", "note": ""},
+    "lijst 7": {"link": "", "note": ""},
+    "lijst 8": {"link": "", "note": ""},
+    "lijst 9": {"link": "", "note": ""},
+    "lijst 10": {"link": "", "note": ""},
 }
 
-# ✅ EXCLUDE toegepast op alle bronnen (ook hashtag)
+# Uitsluiten: iedereen uit deze lijst(en) nooit repost/like
 EXCLUDE_LISTS = {
     "exclude 1": {
         "link": "https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkghzcmt72w",
@@ -63,11 +72,11 @@ SLEEP_SECONDS = float(os.getenv("SLEEP_SECONDS", "2"))
 STATE_FILE = os.getenv("STATE_FILE", "state.json")
 
 LIST_MEMBER_LIMIT = int(os.getenv("LIST_MEMBER_LIMIT", "1500"))
-AUTHOR_POSTS_PER_MEMBER = int(os.getenv("AUTHOR_POSTS_PER_MEMBER", "10"))
+AUTHOR_POSTS_PER_MEMBER = int(os.getenv("AUTHOR_POSTS_PER_MEMBER", "30"))  # aanrader voor "nieuwste mediapost"
 FEED_MAX_ITEMS = int(os.getenv("FEED_MAX_ITEMS", "500"))
 HASHTAG_MAX_ITEMS = int(os.getenv("HASHTAG_MAX_ITEMS", "100"))
 
-# Secrets in GitHub
+# Secrets (GitHub)
 ENV_USERNAME = "BSKY_USERNAME"
 ENV_PASSWORD = "BSKY_PASSWORD"
 
@@ -272,7 +281,7 @@ def build_candidates_from_feed_items(
     force_refresh: bool,
 ) -> List[Dict]:
     """
-    force_refresh=True (PROMO): cutoff wordt genegeerd -> posts mogen ouder zijn dan HOURS_BACK.
+    force_refresh=True (PROMO): cutoff wordt genegeerd.
     """
     cands: List[Dict] = []
     for item in items:
@@ -536,7 +545,7 @@ def main():
             if d:
                 exclude_dids.add(d.lower())
 
-    # promo sort
+    # promo sort (alleen voor fetch-volgorde; uiteindelijke repost-volgorde regelen we later)
     def promo_sort(item: Tuple[str, str, str], promo_key: str) -> int:
         return 0 if item[0] == promo_key else 1
 
@@ -574,67 +583,64 @@ def main():
             )
 
             if is_promo:
-                # ✅ PROMO: per member alleen de nieuwste mediapost, cutoff genegeerd door builder
+                # ✅ PROMO: per member alleen de nieuwste mediapost (cutoff genegeerd door builder)
                 if cands:
                     all_candidates.append(cands[-1])
             else:
                 all_candidates.extend(cands)
 
-    # hashtag (exclude toegepast; cutoff blijft gelden)
+    # hashtag
     log(f"🔎 Hashtag search: {HASHTAG_QUERY}")
     hashtag_posts = fetch_hashtag_posts(client, HASHTAG_MAX_ITEMS)
     log(f"Hashtag posts fetched: {len(hashtag_posts)}")
-    all_candidates.extend(
-        build_candidates_from_postviews(hashtag_posts, cutoff, exclude_handles, exclude_dids)
-    )
+    all_candidates.extend(build_candidates_from_postviews(hashtag_posts, cutoff, exclude_handles, exclude_dids))
 
-    # dedupe + sort
+    # ============================================================
+    # DEDUPE + VERWERKING: PROMO ALS LAATSTE (zodat het bovenaan staat)
+    # ============================================================
+
     seen: Set[str] = set()
-    candidates: List[Dict] = []
-    for c in sorted(all_candidates, key=lambda x: x["created"]):
+    deduped: List[Dict] = []
+    for c in all_candidates:
         if c["uri"] in seen:
             continue
         seen.add(c["uri"])
-        candidates.append(c)
+        deduped.append(c)
 
-    log(f"🧩 Candidates total (deduped): {len(candidates)}")
+    promo_cands = [c for c in deduped if c.get("force_refresh")]
+    normal_cands = [c for c in deduped if not c.get("force_refresh")]
+
+    # normaal oudste->nieuwste
+    normal_cands.sort(key=lambda x: x["created"])
+    # promo deterministisch (tijd maakt niet uit, want we posten ze toch als laatste)
+    promo_cands.sort(key=lambda x: x["created"])
+
+    log(f"🧩 Candidates total (deduped): {len(deduped)} | normal: {len(normal_cands)} | promo: {len(promo_cands)}")
 
     total_done = 0
     per_user_count: Dict[str, int] = {}
 
-    for c in candidates:
-        if total_done >= MAX_PER_RUN:
+    # reserveer ruimte zodat promo altijd nog past
+    reserve_for_promo = len(promo_cands)
+    normal_budget = max(0, MAX_PER_RUN - reserve_for_promo)
+
+    # 1) normaal eerst
+    for c in normal_cands:
+        if total_done >= normal_budget:
             break
 
         ak = c["author_key"]
         per_user_count.setdefault(ak, 0)
 
-        # per-user limit geldt voor normale posts; promo refresh mag altijd
-        if per_user_count[ak] >= MAX_PER_USER and not c.get("force_refresh"):
+        if per_user_count[ak] >= MAX_PER_USER:
             continue
 
-        ok = repost_and_like(
-            client, me, c["uri"], c["cid"], repost_records, like_records, force_refresh=bool(c.get("force_refresh"))
-        )
+        ok = repost_and_like(client, me, c["uri"], c["cid"], repost_records, like_records, force_refresh=False)
         if ok:
             total_done += 1
-            if not c.get("force_refresh"):
-                per_user_count[ak] += 1
+            per_user_count[ak] += 1
             log(f"✅ Repost+Like: {c['uri']}")
             time.sleep(SLEEP_SECONDS)
 
-    state["repost_records"] = repost_records
-    state["like_records"] = like_records
-    save_state(STATE_FILE, state)
-    log(f"🔥 Done — total reposts this run: {total_done}")
-
-
-if __name__ == "__main__":
-    try:
-        print("=== ABOUT TO CALL MAIN ===", flush=True)
-        main()
-    except Exception:
-        import traceback
-        print("=== FATAL ERROR ===", flush=True)
-        traceback.print_exc()
-        raise
+    # 2) PROMO ALS LAATSTE (feed + lijst)
+  
