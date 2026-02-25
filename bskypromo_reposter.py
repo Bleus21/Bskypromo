@@ -48,7 +48,6 @@ LIJSTEN = {
     "lijst 10": {"link": "", "note": ""},
 }
 
-# Uitsluiten: iedereen uit deze lijst(en) nooit repost/like
 EXCLUDE_LISTS = {
     "exclude 1": {
         "link": "https://bsky.app/profile/did:plc:5si6ivvplllayxrf6h5euwsd/lists/3mfkghzcmt72w",
@@ -545,7 +544,7 @@ def main():
             if d:
                 exclude_dids.add(d.lower())
 
-    # promo sort (alleen voor fetch-volgorde; uiteindelijke repost-volgorde regelen we later)
+    # promo sort (alleen fetch-volgorde)
     def promo_sort(item: Tuple[str, str, str], promo_key: str) -> int:
         return 0 if item[0] == promo_key else 1
 
@@ -602,17 +601,18 @@ def main():
     seen: Set[str] = set()
     deduped: List[Dict] = []
     for c in all_candidates:
-        if c["uri"] in seen:
+        uri = c.get("uri")
+        if not uri:
             continue
-        seen.add(c["uri"])
+        if uri in seen:
+            continue
+        seen.add(uri)
         deduped.append(c)
 
     promo_cands = [c for c in deduped if c.get("force_refresh")]
     normal_cands = [c for c in deduped if not c.get("force_refresh")]
 
-    # normaal oudste->nieuwste
     normal_cands.sort(key=lambda x: x["created"])
-    # promo deterministisch (tijd maakt niet uit, want we posten ze toch als laatste)
     promo_cands.sort(key=lambda x: x["created"])
 
     log(f"🧩 Candidates total (deduped): {len(deduped)} | normal: {len(normal_cands)} | promo: {len(promo_cands)}")
@@ -642,5 +642,9 @@ def main():
             log(f"✅ Repost+Like: {c['uri']}")
             time.sleep(SLEEP_SECONDS)
 
-    # 2) PROMO ALS LAATSTE (feed + lijst)
-  
+    # 2) PROMO ALS LAATSTE (feed + lijst) → blijft bovenaan
+    for c in promo_cands:
+        if total_done >= MAX_PER_RUN:
+            break
+
+        ok = repost_and_like(client, me, c["uri"], c["cid"], repost_recor
