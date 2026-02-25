@@ -642,9 +642,29 @@ def main():
             log(f"✅ Repost+Like: {c['uri']}")
             time.sleep(SLEEP_SECONDS)
 
-    # 2) PROMO ALS LAATSTE (feed + lijst) → blijft bovenaan
+        # 2) PROMO ALS LAATSTE (feed + lijst) → blijft bovenaan
     for c in promo_cands:
         if total_done >= MAX_PER_RUN:
             break
 
-        ok = repost_and_like(client, me, c["uri"], c["cid"], repost_recor
+        ok = repost_and_like(client, me, c["uri"], c["cid"], repost_records, like_records, force_refresh=True)
+        if ok:
+            total_done += 1
+            log(f"✅ PROMO refresh repost+like: {c['uri']}")
+            time.sleep(SLEEP_SECONDS)
+
+    state["repost_records"] = repost_records
+    state["like_records"] = like_records
+    save_state(STATE_FILE, state)
+    log(f"🔥 Done — total reposts this run: {total_done}")
+
+
+if __name__ == "__main__":
+    try:
+        print("=== ABOUT TO CALL MAIN ===", flush=True)
+        main()
+    except Exception:
+        import traceback
+        print("=== FATAL ERROR ===", flush=True)
+        traceback.print_exc()
+        raise
